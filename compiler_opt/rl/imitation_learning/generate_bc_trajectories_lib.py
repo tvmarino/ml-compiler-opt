@@ -71,7 +71,8 @@ class SequenceExampleFeatureNames:
 
 
 def get_loss(seq_example: tf.train.SequenceExample,
-             reward_key: str = SequenceExampleFeatureNames.reward) -> int:
+             reward_key: str = SequenceExampleFeatureNames.reward,
+             variance_key: str | None = None) -> int:
   """Return the last loss/reward of a trajectory written in a SequenceExample.
 
   Args:
@@ -82,13 +83,18 @@ def get_loss(seq_example: tf.train.SequenceExample,
   Returns:
     The loss/reward of a trajectory written in a SequenceExample.
   """
+  variance_key = 'variance'
+  variance = (seq_example.feature_lists
+              .feature_list[variance_key].feature[-1].float_list.value[0]
+                if variance_key else 0.)
   return (seq_example.feature_lists.feature_list[reward_key].feature[-1]
-          .float_list.value[0])
+          .float_list.value[0],
+          variance)
 
 
 def add_int_feature(
     sequence_example: tf.train.SequenceExample,
-    feature_value: np.int64,
+    feature_value: np.int64 | list[np.int64],
     feature_name: str,
 ):
   """Add an int feature to feature list.
@@ -102,12 +108,15 @@ def add_int_feature(
   """
   f = sequence_example.feature_lists.feature_list[feature_name].feature.add()
   lst = f.int64_list.value
-  lst.extend([feature_value])
+  if isinstance(feature_value, np.ndarray):
+    lst.extend(feature_value)
+  else:
+    lst.extend([feature_value])
 
 
 def add_float_feature(
     sequence_example: tf.train.SequenceExample,
-    feature_value: np.float32,
+    feature_value: np.float32 | list[np.float32],
     feature_name: str,
 ):
   """Add a float feature to feature list.
@@ -121,7 +130,10 @@ def add_float_feature(
   """
   f = sequence_example.feature_lists.feature_list[feature_name].feature.add()
   lst = f.float_list.value
-  lst.extend([feature_value])
+  if isinstance(feature_value, np.ndarray):
+    lst.extend(feature_value)
+  else:
+    lst.extend([feature_value])
 
 
 def add_string_feature(
@@ -150,7 +162,12 @@ def add_feature_list(seq_example: tf.train.SequenceExample,
     feature_list: list of feature values to add to seq_example
     feature_name: name of the feature to add the list under
   """
-  if (type(feature_list[0]) not in [
+  feature_list_type = None
+  if isinstance(feature_list, np.ndarray):
+    feature_list_type = type(feature_list.flatten()[0])
+  else:
+    feature_list_type = type(feature_list[0])
+  if (feature_list_type not in [
       np.dtype(np.int64),
       np.dtype(np.float32),
       str,
@@ -158,9 +175,9 @@ def add_feature_list(seq_example: tf.train.SequenceExample,
     raise AssertionError(f'Unsupported type for feature {feature_name}'
                          f' of type {type(feature_list[0])}. '
                          'Supported types are np.int64, np.float32, str')
-  if isinstance(feature_list[0], np.float32):
+  if feature_list_type == np.float32:
     add_function = add_float_feature
-  elif isinstance(feature_list[0], int | np.int64):
+  elif feature_list_type in [int, np.int64]:
     add_function = add_int_feature
   else:
     add_function = add_string_feature
@@ -355,7 +372,7 @@ class ModuleExplorer:
         obs_spec=obs_spec,
         action_spec=action_spec,
         explicit_temps_dir=explicit_temps_dir,
-        interactive_only=True,
+        # interactive_only=True,
     )
     if self._env.action_spec:
       if self._env.action_spec.dtype != tf.int64:
@@ -398,13 +415,15 @@ class ModuleExplorer:
         action = policy(timestep)
         add_int_feature(sequence_example, int(action),
                         SequenceExampleFeatureNames.action)
+        add_string_feature(sequence_example, str(curr_obs_dict.context),
+                           'function_name')
         curr_obs_dict = self._env.step(action)
         curr_obs = curr_obs_dict.obs
         if curr_obs_dict.step_type == env.StepType.LAST:
           break
         self._process_obs(curr_obs, sequence_example)
-    except AssertionError as e:
-      logging.error('AssertionError: %s', e)
+    except (AssertionError, TypeError) as e:
+      logging.error('%s for module: %s', e, self._loaded_module_spec.name)
     horizon = len(sequence_example.feature_lists.feature_list[
         SequenceExampleFeatureNames.action].feature)
     self._working_dir = curr_obs_dict.working_dir
@@ -412,15 +431,20 @@ class ModuleExplorer:
       working_dir_head = os.path.split(self._working_dir)[0]
       shutil.rmtree(working_dir_head)
     if horizon <= 0:
-      raise ValueError('Policy did not take any inlining decision for module '
+      raise ValueError('Policy did not take any decision for module '
                        f'{self._loaded_module_spec.name}.')
     if curr_obs_dict.step_type != env.StepType.LAST:
       raise ValueError('Compilation loop exited at step type'
                        f'{curr_obs_dict.step_type} before last step')
     reward = curr_obs_dict.score_policy[self._reward_key]
     reward_list = np.float32(reward) * np.float32(np.ones(horizon))
+    # TODO(tvmarinov): handle variance the same as reward
+    variance = curr_obs_dict.score_policy['variance']
+    variance_list = np.float32(variance) * np.float32(np.ones(horizon))
     add_feature_list(sequence_example, reward_list,
                      SequenceExampleFeatureNames.reward)
+    add_feature_list(sequence_example, variance_list,
+                     'variance')
     module_name_list = [self._loaded_module_spec.name for _ in range(horizon)]
     add_feature_list(sequence_example, module_name_list,
                      SequenceExampleFeatureNames.module_name)
@@ -628,7 +652,7 @@ class ModuleWorkerResultProcessor:
       seq_example: sequence example from the compiled module
       partitions: a tuple of limits defining the buckets
       label_name: name of the feature which will contain the bucket index."""
-    seq_loss = get_loss(seq_example)
+    seq_loss = get_loss(seq_example)[0]
 
     label = bisect.bisect_right(partitions, seq_loss)
     horizon = len(seq_example.feature_lists.feature_list[
@@ -647,9 +671,12 @@ class ModuleWorkerResultProcessor:
     seq_example_list = [exploration_res[0] for exploration_res in succeeded]
     working_dir_list = [(exploration_res[1], exploration_res[2])
                         for exploration_res in succeeded]
-    seq_example_losses = [exploration_res[3] for exploration_res in succeeded]
+    seq_example_losses = np.array(
+      [exploration_res[3] for exploration_res in succeeded])
 
-    best_policy_idx = np.argmin(seq_example_losses)
+    logging.info('Variance of rewards: %s', seq_example_losses[:, -1])
+
+    best_policy_idx = np.argmin(seq_example_losses[:,0])
     best_exploration_idx = working_dir_list[best_policy_idx][1]
 
     # comparator is the last policy in the policy_paths list
@@ -690,12 +717,13 @@ class ModuleWorkerResultProcessor:
       per_module_dict: dictionary containing the name, loss and horizon of
         compiled module.
     """
-
+    loss, variance = get_loss(feature_list)
     per_module_dict = {
         SequenceExampleFeatureNames.module_name:
             module_name,
         SequenceExampleFeatureNames.loss:
-            float(get_loss(feature_list)),
+            float(loss),
+        'variance': variance,
         SequenceExampleFeatureNames.horizon:
             len(feature_list.feature_lists.feature_list[
                 SequenceExampleFeatureNames.action].feature),
@@ -710,9 +738,15 @@ class ModuleWorkerResultProcessor:
     save_dir = os.path.join(persistent_objects_path, path_head)
     if not os.path.exists(save_dir):
       os.makedirs(save_dir, exist_ok=True)
+    # shutil.copytree(
+    #     # os.path.join(binary_path, path_tail),
+    #     binary_path,
+    #     save_dir,
+    #     dirs_exist_ok=True)
     shutil.copy(
-        os.path.join(binary_path, 'compiled_module'),
-        os.path.join(save_dir, path_tail))
+      os.path.join(binary_path, path_tail),
+      save_dir,
+    )
 
 
 @gin.configurable

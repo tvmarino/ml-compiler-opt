@@ -125,6 +125,21 @@ class ClangProcess:
     self._module_name = module_name
     self._working_dir = working_dir
 
+    self._terminal_obs = TimeStep(
+        obs=None,
+        reward=None,
+        score_policy=None,
+        score_default=None,
+        context=None,
+        module_name=module_name,
+        working_dir=working_dir,
+        obs_id=None,
+        step_type=StepType.LAST,
+    )
+
+  def get_observation(self) -> TimeStep:
+    return self._terminal_obs
+
   def get_scores(self, timeout: int | None = None):
     self._proc.wait(timeout=timeout)
     return self._get_scores_fn()
@@ -493,6 +508,7 @@ class MLGOEnvironmentBase:
         interactive_only=interactive_only)
     self._obs_spec = obs_spec
     self._action_spec = action_spec
+    self._interactive_only = interactive_only
 
     self._iclang: InteractiveClang | None = None
     self._clang: ClangProcess | None = None
@@ -512,7 +528,10 @@ class MLGOEnvironmentBase:
     self._last_obs = self._iclang.get_observation()
     if self._last_obs.step_type == StepType.LAST:
       self._last_obs.score_policy = self._iclang.get_scores()
-      self._last_obs.score_default = self._clang.get_scores()
+      if self._interactive_only:
+        self._last_obs.score_default = self._last_obs.score_policy
+      else:
+        self._last_obs.score_default = self._clang.get_scores()
       self._last_obs.reward = compute_relative_rewards(
           self._last_obs.score_policy, self._last_obs.score_default)
     return self._last_obs
