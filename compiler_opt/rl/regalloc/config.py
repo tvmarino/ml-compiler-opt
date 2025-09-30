@@ -54,7 +54,10 @@ def get_regalloc_signature_spec():
   })
   observation_spec['progress'] = tensor_spec.BoundedTensorSpec(
       dtype=tf.float32, shape=(), name='progress', minimum=0, maximum=1)
-
+  # This has to be tf.int64 otherwise the interactive environment will hang
+  observation_spec['default_decision'] = tensor_spec.BoundedTensorSpec(
+    dtype=tf.int64, shape=(), name='default_decision', minimum=0, maximum=32
+  )
   reward_spec = tf.TensorSpec(dtype=tf.float32, shape=(), name='reward')
   time_step_spec = time_step.time_step_spec(observation_spec, reward_spec)
 
