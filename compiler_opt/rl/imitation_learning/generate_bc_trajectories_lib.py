@@ -84,12 +84,11 @@ def get_loss(seq_example: tf.train.SequenceExample,
     The loss/reward of a trajectory written in a SequenceExample.
   """
   variance_key = 'variance'
-  variance = (seq_example.feature_lists
-              .feature_list[variance_key].feature[-1].float_list.value[0]
-                if variance_key else 0.)
+  variance = (
+      seq_example.feature_lists.feature_list[variance_key].feature[-1]
+      .float_list.value[0] if variance_key else 0.)
   return (seq_example.feature_lists.feature_list[reward_key].feature[-1]
-          .float_list.value[0],
-          variance)
+          .float_list.value[0], variance)
 
 
 def add_int_feature(
@@ -248,6 +247,8 @@ class ExplorationWithPolicy:
       action according to explore_policy and second most likely action
     explore_on_features: dict of feature names and functions which specify
       when to explore on the respective feature
+    explore_on_features_full_seq: dict of feature names and functions which specify
+      when to explore on the respective feature
   """
 
   def __init__(
@@ -256,7 +257,8 @@ class ExplorationWithPolicy:
       policy: Callable[[time_step.TimeStep], np.ndarray],
       explore_policy: Callable[[time_step.TimeStep], policy_step.PolicyStep],
       explore_on_features: dict[str, Callable[[tf.Tensor], bool]] | None = None,
-  ):
+      explore_on_features_full_seq: dict[str, Callable[[list[env.TimeStep]], list[int]]]
+      | None = None):
     self._explore_step: int = len(replay_prefix) - 1
     self._explore_state: time_step.TimeStep | None = None
     self._replay_prefix = replay_prefix
@@ -265,8 +267,9 @@ class ExplorationWithPolicy:
     self._curr_step = 0
     self._gap = np.inf
     self._explore_on_features: dict[str,
-                                    Callable[[tf.Tensor],
+                                    Callable[[tf.Tensor, str],
                                              bool]] | None = explore_on_features
+    self._explore_on_features_full_seq = explore_on_features_full_seq
     self._stop_exploration = False
 
   def _compute_gap(self, distr: np.ndarray) -> np.float32:
@@ -316,6 +319,23 @@ class ExplorationWithPolicy:
     self._curr_step += 1
     return policy_action
 
+  # TODO(tvmarinov@): need to explore on the full sequence
+  def explore_on_feature_full_seq(
+      self,
+      obs_dict_seq: list[env.TimeStep],
+      prev_explore_step: int,
+      create_timestep: Callable[[env.TimeStep], time_step.TimeStep]):
+    if self._explore_on_features_full_seq is None:
+      return
+    for explore_on_feature_full_seq in self._explore_on_features_full_seq.values():
+      for explore_step in explore_on_feature_full_seq(obs_dict_seq):
+        if explore_step > prev_explore_step:
+          self._explore_step = explore_step
+          explore_state = create_timestep(obs_dict_seq[explore_step])
+          self._explore_state = explore_state
+          self._stop_exploration = True
+          break
+
 
 class ModuleExplorer:
   """Class which implements the exploration for the given module.
@@ -328,6 +348,8 @@ class ModuleExplorer:
     max_horizon_to_explore: if the horizon under policy is greater than this
       we do not do exploration
     explore_on_features: dict of feature names and functions which specify
+      when to explore on the respective feature
+    explore_on_features_full_seq: dict of feature names and functions which specify
       when to explore on the respective feature
     reward_key: which reward binary to use, must be specified as part of
       additional task args (kwargs).
@@ -342,6 +364,7 @@ class ModuleExplorer:
       max_exploration_steps: int = 10,
       max_horizon_to_explore=np.inf,
       explore_on_features: dict[str, Callable[[tf.Tensor], bool]] | None = None,
+      explore_on_features_full_seq: dict[str, Callable[[list[env.TimeStep]], list[int]]] | None = None,
       obs_action_specs: tuple[time_step.TimeStep, tensor_spec.BoundedTensorSpec]
       | None = None,
       reward_key: str = '',
@@ -372,7 +395,7 @@ class ModuleExplorer:
         obs_spec=obs_spec,
         action_spec=action_spec,
         explicit_temps_dir=explicit_temps_dir,
-        # interactive_only=True,
+        interactive_only=True,
     )
     if self._env.action_spec:
       if self._env.action_spec.dtype != tf.int64:
@@ -383,13 +406,16 @@ class ModuleExplorer:
     self._max_exploration_steps = max_exploration_steps
     self._max_horizon_to_explore = max_horizon_to_explore
     self._explore_on_features = explore_on_features
+    self._explore_on_features_full_seq = explore_on_features_full_seq
     logging.info('Reward key in exploration worker: %s', self._reward_key)
 
     self._rng = np.random.default_rng()
+    self._obs_dict_seq = []
 
   def compile_module(
       self,
       policy: Callable[[time_step.TimeStep | None], np.ndarray],
+      explore_step: int = 0
   ) -> tf.train.SequenceExample:
     """Compiles the module with the given policy and outputs a seq. example.
 
@@ -405,24 +431,42 @@ class ModuleExplorer:
         reward returned by the environment and module_name is the name of
         the module processed by the compiler.
     """
+    self._obs_dict_seq = []
     sequence_example = tf.train.SequenceExample()
-    curr_obs_dict = self._env.reset(self._loaded_module_spec)
     try:
+      curr_obs_dict = self._env.reset(self._loaded_module_spec)
+      # debug
+      # if '_ZN4llvm12SelectionDAG7CombineENS_12CombineLevelEPNS_14BatchAAResultsENS_15CodeGenOptLevelE' in curr_obs_dict.context:
+      #   print('in')
+    except TimeoutError as e:
+      logging.error('%s for module: %s', e, self._loaded_module_spec.name)
+      raise ValueError('Policy did not take any decision for module '
+                       f'{self._loaded_module_spec.name}.') from e
+    try:
+      self._obs_dict_seq.append(curr_obs_dict)
       curr_obs = curr_obs_dict.obs
       self._process_obs(curr_obs, sequence_example)
+      curr_step = 0
       while curr_obs_dict.step_type != env.StepType.LAST:
+        # if '_ZN4llvm12SelectionDAG7CombineENS_12CombineLevelEPNS_14BatchAAResultsENS_15CodeGenOptLevelE' in curr_obs_dict.context:
+        #   print('in')
         timestep = self._create_timestep(curr_obs_dict)
         action = policy(timestep)
         add_int_feature(sequence_example, int(action.item()),
                         SequenceExampleFeatureNames.action)
+        # Regalloc change for function name
         add_string_feature(sequence_example, str(curr_obs_dict.context),
                            'function_name')
+        if explore_step == curr_step:
+          logging.info('Exploring in function %s at step %s', str(curr_obs_dict.context), explore_step)
         curr_obs_dict = self._env.step(action)
         curr_obs = curr_obs_dict.obs
+        curr_step += 1
         if curr_obs_dict.step_type == env.StepType.LAST:
           break
+        self._obs_dict_seq.append(curr_obs_dict)
         self._process_obs(curr_obs, sequence_example)
-    except (AssertionError, TypeError) as e:
+    except (AssertionError, TypeError, TimeoutError) as e:
       logging.error('%s for module: %s', e, self._loaded_module_spec.name)
     horizon = len(sequence_example.feature_lists.feature_list[
         SequenceExampleFeatureNames.action].feature)
@@ -443,8 +487,7 @@ class ModuleExplorer:
     variance_list = np.float32(variance) * np.float32(np.ones(horizon))
     add_feature_list(sequence_example, reward_list,
                      SequenceExampleFeatureNames.reward)
-    add_feature_list(sequence_example, variance_list,
-                     'variance')
+    add_feature_list(sequence_example, variance_list, 'variance')
     module_name_list = [self._loaded_module_spec.name for _ in range(horizon)]
     add_feature_list(sequence_example, module_name_list,
                      SequenceExampleFeatureNames.module_name)
@@ -492,8 +535,13 @@ class ModuleExplorer:
         policy,
         explore_policy,
         self._explore_on_features,
+        explore_on_features_full_seq=self._explore_on_features_full_seq,
     )
     base_seq = self.compile_module(base_policy.get_advice)
+    base_policy.explore_on_feature_full_seq(
+      obs_dict_seq=self._obs_dict_seq,
+      prev_explore_step=0,
+      create_timestep=self._create_timestep)
     seq_example_list.append(base_seq)
     working_dir_names.append(self._working_dir)
     base_seq_loss = get_loss(base_seq)
@@ -570,8 +618,14 @@ class ModuleExplorer:
     distr_logits = explore_policy(explore_state).action.logits.numpy()[0]
     for _ in range(num_samples):
       distr_logits[replay_prefix[explore_step]] = -np.inf
+      if 'mask' in explore_state.observation:
+        mask = explore_state.observation['mask'][0].numpy()
+        mask = np.ones_like(mask) - mask
+        distr_logits[mask.astype(bool)] = -np.inf
       if all(-np.inf == logit for logit in distr_logits):
         break
+      logging.info('Distr logits %s at step %s', scipy.special.softmax(distr_logits), explore_step)
+      logging.info('Previous action %s', replay_prefix[explore_step])
       replay_prefix[explore_step] = self._rng.choice(
           range(distr_logits.shape[0]), p=scipy.special.softmax(distr_logits))
       base_policy = ExplorationWithPolicy(
@@ -579,8 +633,14 @@ class ModuleExplorer:
           policy,
           explore_policy,
           self._explore_on_features,
+          explore_on_features_full_seq=self._explore_on_features_full_seq,
       )
-      base_seq = self.compile_module(base_policy.get_advice)
+      base_seq = self.compile_module(base_policy.get_advice, explore_step=explore_step)
+      base_policy.explore_on_feature_full_seq(
+        obs_dict_seq=self._obs_dict_seq,
+        prev_explore_step=explore_step,
+        create_timestep=self._create_timestep
+      )
       yield base_seq, base_policy
 
   def _build_replay_prefix_list(self, seq_ex):
@@ -672,11 +732,11 @@ class ModuleWorkerResultProcessor:
     working_dir_list = [(exploration_res[1], exploration_res[2])
                         for exploration_res in succeeded]
     seq_example_losses = np.array(
-      [exploration_res[3] for exploration_res in succeeded])
+        [exploration_res[3] for exploration_res in succeeded])
 
     logging.info('Variance of rewards: %s', seq_example_losses[:, -1])
 
-    best_policy_idx = np.argmin(seq_example_losses[:,0])
+    best_policy_idx = np.argmin(seq_example_losses[:, 0])
     best_exploration_idx = working_dir_list[best_policy_idx][1]
 
     # comparator is the last policy in the policy_paths list
@@ -723,7 +783,8 @@ class ModuleWorkerResultProcessor:
             module_name,
         SequenceExampleFeatureNames.loss:
             float(loss),
-        'variance': variance,
+        'variance':
+            variance,
         SequenceExampleFeatureNames.horizon:
             len(feature_list.feature_lists.feature_list[
                 SequenceExampleFeatureNames.action].feature),
@@ -744,8 +805,8 @@ class ModuleWorkerResultProcessor:
     #     save_dir,
     #     dirs_exist_ok=True)
     shutil.copy(
-      os.path.join(binary_path, path_tail),
-      save_dir,
+        os.path.join(binary_path, path_tail),
+        save_dir,
     )
 
 

@@ -406,7 +406,10 @@ def clang_session(
       os.mkfifo(reader_name, 0o666)
       os.mkfifo(writer_name, 0o666)
     with subprocess.Popen(
-        cmdline, stderr=subprocess.PIPE, stdout=subprocess.PIPE) as proc:
+        cmdline,
+        stderr=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        cwd='/google/src/cloud/tvmarinov/regalloc_workflow/google3') as proc:
       try:
         if interactive:
           with interactive_session(
