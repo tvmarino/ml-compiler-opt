@@ -3,6 +3,7 @@ import shutil
 import subprocess
 import contextlib
 import json
+import random
 
 import gin
 import tensorflow as tf
@@ -35,33 +36,26 @@ class RegallocTask(env.MLGOTask):
   def __init__(
       self,
       default_reward_key: str = 'default',
-      base_target_path: str = '/mlgo_regalloc_clang/thinlto_build/clang_corpus_target/objs/',
-      # base_target_path: str = '/tmp/clang_corpus/objs',
-      baseline_path: str = '/mlgo_regalloc_clang/thinlto_build/clang_corpus/objs',
-      # baseline_path: str = '/tmp/clang_corpus_bak/objs',
-      link_command_path: str = '/mlgo_regalloc_clang/thinlto_build/clang_corpus/link.sh',
-      # link_command_path: str = '/tmp/clang_corpus/link.sh',
-      # perf5_command_path: str = '/mlgo_regalloc_clang/thinlto_build/perf5_miba.sh'
-      perf5_command_path: str = '/mlgo_regalloc_clang/thinlto_build/perf5_command.sh'
+      base_target_path: str = '/work_clean/clang_corpus',
+      baseline_path: str = '/work_clean/clang_corpus_bak',
+      link_command_path: str = '/work_clean/clang_corpus/link.sh',
+      bb_trace_path: str = '/work_clean/BB_trace/bb_trace.pb',
+      function_index_path: str = '/work_clean/BB_trace/function_index.pb',
+      use_splits: bool = True,
+      bb_trace_split_dir: str = '/work_clean/BB_trace_split',
+      shard_count: int = 64,
   ):
     super().__init__()
     self._default_reward_key: str = default_reward_key
     self._base_target_path: str = base_target_path
     self._baseline_path: str = baseline_path
-    # with open(link_command_path, encoding='utf-8') as link_command_file:
-    #   link_command = link_command_file.read()
-    # link_command = link_command.strip('\n')
-    # link_command = link_command.strip('\t')
-    # self._link_command: list[str] = link_command.split(' ')
-    # run_sh_path = os.path.join(base_target_path, 'run_ar.sh')
-    # self._llvm_ar_command: list[str] = ['bash'] + [run_sh_path]
     self._link_command = ['bash'] + [link_command_path]
-    # with open(perf5_command_path, encoding='utf-8') as perf5_command_file:
-    #   perf5_command = perf5_command_file.read()
-    # perf5_command = perf5_command.strip('\n')
-    # perf5_command = perf5_command.strip('\t')
-    # self._perf5_command: list[str] = perf5_command.split(' ')
-    self._perf5_command: list[str] = ['bash'] + [perf5_command_path]
+    self._bb_trace_path = bb_trace_path
+    self._function_index_path = function_index_path
+    self._binary_path = '/work_clean/clang_corpus/clang'
+    self._use_splits = use_splits
+    self._bb_trace_split_dir = bb_trace_split_dir
+    self._shard_count = shard_count
 
   def get_cmdline(self, clang_path: str, base_args: list[str],
                   interactive_base_path: str | None,
@@ -90,64 +84,64 @@ class RegallocTask(env.MLGOTask):
       return {self._default_reward_key: -1., 'variance': 0.}
 
     baseline_path = os.path.join(self._baseline_path, 'blaze-out')
-    # base_target_path = os.path.join(self._base_target_path, 'blaze-out')
     base_target_path = self._base_target_path
 
     shutil.copy(
         os.path.join(working_dir, self.module_name),
         self.target_module_root_path,
     )
-    subprocess.run(
-      'echo 1 | sudo tee /proc/sys/vm/drop_caches'.split(' '),
-      capture_output=True,
-      check=True,
-    )
-    # subprocess.run(
-    #     self._llvm_ar_command,
-    #     cwd=self._base_target_path,
-    #     capture_output=True,
-    #     check=True)
+
     subprocess.run(
         self._link_command,
-        # cwd=self._base_target_path,
-        cwd='/google/src/cloud/tvmarinov/regalloc_workflow/google3',
+        # cwd='/google/src/cloud/tvmarinov/regalloc_workflow/google3',
         capture_output=True,
         check=True)
 
-    subprocess.run(['bash', '/mlgo_regalloc_clang/thinlto_build/miba_scp.sh'],
-                 capture_output=True,
-                 check=True)
-    perf5_outs = []
-    for _ in range(self.num_perf_reps):
-      while True:
-        try:
-          perf5_completed = subprocess.run(
-              self._perf5_command, capture_output=True, check=True)
-        except subprocess.CalledProcessError as e:
-          print(e)
-          continue
-        # TODO(tvmarinov): why is this stderr
-        perf5_out = perf5_completed.stderr
-        perf5_out = [
-            i for i in str(perf5_out.decode('utf-8')).split('\n\n')[2].split(' ')
-            if i != ''
-        ]
-        if '(' not in perf5_out[-1]:
-          break
-      cycles = float(perf5_out[0].replace(',', ''))
-      logging.info('cycles: %f', cycles)
-      # variance = float(perf5_out[-2].replace('%', ''))
-      perf5_outs.append(cycles)
-    buckets = np.array_split(perf5_outs, 4)
-    bucket_means = [np.median(bucket) for bucket in buckets]
-    cycles = np.median(perf5_outs)
-    variance = np.std(bucket_means)
+    if self._use_splits:
+      shard_id = random.randint(0, self._shard_count - 1)
+      bb_trace_path = os.path.join(self._bb_trace_split_dir, f'bb_trace{shard_id}.pb')
+      logging.info('Using split trace shard: %d', shard_id)
+    else:
+      bb_trace_path = self._bb_trace_path
+
+    # Use basic_block_trace_model instead of perf5
+    bb_trace_command = [
+        'blaze', 'run', '-c', 'opt',
+        '//devtools/crosstool/memtrace_costmodel:basic_block_trace_model',
+        '--',
+        f'--bb_trace_path={bb_trace_path}',
+        f'--function_index_path={self._function_index_path}',
+        f'--binary_path={self._binary_path}'
+    ]
+    
+    bb_trace_completed = subprocess.run(
+        bb_trace_command,
+        cwd='/google/src/cloud/tvmarinov/regalloc_workflow/google3',
+        capture_output=True,
+        check=True)
+        
+    output = bb_trace_completed.stdout.decode("utf-8")
+    
+    segment_costs = []
+    for line in output.split("\n"):
+      try:
+        value = float(line)
+        segment_costs.append(value)
+      except ValueError:
+        continue
+
+    if len(segment_costs) < 1:
+      raise ValueError("Did not find any valid segment costs.")
+      
+    cycles = np.sum(segment_costs)
+
+    logging.info('Module %s reward: %f', self.module_name, cycles)
 
     subprocess.run(['rsync', '-av', baseline_path, base_target_path],
              capture_output=False,
              check=True)
 
-    return {self._default_reward_key: cycles, 'variance': variance/cycles}
+    return {self._default_reward_key: cycles, 'variance': 0.}
 
 
 def default_policy(curr_obs_dict: time_step.TimeStep) -> np.ndarray:
@@ -209,17 +203,20 @@ class ExploreOnHot:
 
 
 def main(_):
-  clang_path = '/mlgo_regalloc_clang/thinlto_build/clang'
-  explicit_temps_dir = '/mlgo_regalloc_clang/thinlto_build/modules/explicit_temps'
-  base_target_path = '/mlgo_regalloc_clang/thinlto_build/clang_corpus_target/objs/'
+  clang_path = '/work_clean/clang'
+  explicit_temps_dir = '/work_clean/explicit_temps'
+  base_target_path = '/work_clean/clang_corpus/objs/'
   cps = corpus.Corpus(
-      data_path='/mlgo_regalloc_clang/thinlto_build/clang_corpus',
+      data_path='/work_clean/clang_corpus',
       replace_flags={
           '-fprofile-instrument-use-path':
-              '/mlgo_regalloc_clang/thinlto_build/clang_corpus/MergedCS.profdata'
-      })
+              '/work_clean/csfdo.profdata',
+          # '--warning-suppression-mappings':
+              # '/google/src/cloud/tvmarinov/regalloc_workflow/google3/tools/cpp/warning_suppression_mappings.txt'
+      }
+  )
   module_worker_result_processor = ModuleWorkerResultProcessor(
-      persistent_objects_path='/mlgo_regalloc_clang/thinlto_build/persistent_objs'
+      persistent_objects_path='/work_clean/persistent_objs'
   )
   partition_list = [np.inf]
   # partition_list = [
@@ -234,13 +231,13 @@ def main(_):
       cps.load_module_spec(corpus_element) for corpus_element in corpus_elements
   ]
 
-  compile_only = False
+  compile_only = True
   if not compile_only:
-    # policies = [default_policy]
+    policies = [default_policy]
     policies = []
     policy_paths = [
         '/mlgo_regalloc_clang/policies/saved_model1_wraped/',
-        '/mlgo_regalloc_clang/policies/thinlto_es_expl_retired_0/',
+        # '/mlgo_regalloc_clang/policies/thinlto_es_expl_retired_0/',
     ]
     for policy_path in policy_paths:
       tf_policy = tf.saved_model.load(policy_path, tags=None, options=None)
@@ -249,7 +246,7 @@ def main(_):
     # policies.append(default_policy)
     explore_policy_paths = [
       '/mlgo_regalloc_clang/policies/es_thinlto_weighted/',
-      '/mlgo_regalloc_clang/policies/thinlto_es_expl_retired_0/',
+      # '/mlgo_regalloc_clang/policies/thinlto_es_expl_retired_0/',
     ]
     # explore_policies = [None]
     explore_policies = []
@@ -268,9 +265,9 @@ def main(_):
           generate_bc_trajectories_lib.policy_action_wrapper(tf_policy))
     explore_policies = [None]
 
-  output_path = '/mlgo_regalloc_clang/training_data/records'
+  output_path = '/work_clean/training_data/records'
   file_name = 'thinlto_es_expl_retired_01.tfrecord'
-  profiling_file_path = '/mlgo_regalloc_clang/training_data/profiles/thinlto_es_expl_retired_01'
+  profiling_file_path = '/work_clean/training_data/profiles/thinlto_es_expl_retired_01'
   total_profiles_max: list[ProfilingDictValueType | None] = []
   total_profiles_pol: list[ProfilingDictValueType | None] = []
   tf_rec_path = (
@@ -297,7 +294,7 @@ def main(_):
       RegallocTask.num_perf_reps = 8
 
       explore_on_hot = ExploreOnHot(
-          hot_functions_path='/mlgo_regalloc_clang/thinlto_build/perf_thinlto.txt'
+          hot_functions_path='/work_clean/prof.txt'
       )
       exploration_worker = ModuleExplorer(
           loaded_module_spec=loaded_module_spec,

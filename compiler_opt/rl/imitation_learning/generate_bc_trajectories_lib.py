@@ -415,7 +415,7 @@ class ModuleExplorer:
   def compile_module(
       self,
       policy: Callable[[time_step.TimeStep | None], np.ndarray],
-      explore_step: int = 0
+      explore_step: int = -1
   ) -> tf.train.SequenceExample:
     """Compiles the module with the given policy and outputs a seq. example.
 
@@ -466,6 +466,7 @@ class ModuleExplorer:
           break
         self._obs_dict_seq.append(curr_obs_dict)
         self._process_obs(curr_obs, sequence_example)
+        logging.info('current step: %s, function: %s', curr_step, str(curr_obs_dict.context))
     except (AssertionError, TypeError, TimeoutError) as e:
       logging.error('%s for module: %s', e, self._loaded_module_spec.name)
     horizon = len(sequence_example.feature_lists.feature_list[

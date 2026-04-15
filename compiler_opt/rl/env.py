@@ -409,7 +409,8 @@ def clang_session(
         cmdline,
         stderr=subprocess.PIPE,
         stdout=subprocess.PIPE,
-        cwd='/google/src/cloud/tvmarinov/regalloc_workflow/google3') as proc:
+    ) as proc:
+        # cwd='/google/src/cloud/tvmarinov/regalloc_workflow/google3') as proc:
       try:
         if interactive:
           with interactive_session(
